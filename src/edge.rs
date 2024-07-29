@@ -20,18 +20,18 @@ fn clamp<T: PartialOrd>(f: T, lo: T, hi: T) -> T {
 /// The result of a computation.
 #[derive(Clone)]
 pub struct Detection {
-    edges: Vec<Vec<Edge>>,
+    edges: Vec2d<Edge>,
 }
 
 impl Detection {
     /// Returns the width of the computed image.
     pub fn width(&self) -> usize {
-        self.edges.len()
+        self.edges.width
     }
 
     /// Returns the height of the computed image.
     pub fn height(&self) -> usize {
-        self.edges[0].len()
+        self.edges.height
     }
 
     /// Linearly interpolates the edge at the specified location.
@@ -42,10 +42,10 @@ impl Detection {
         let ay = clamp(y.floor() as isize, 0, self.height() as isize - 1) as usize;
         let bx = clamp(x.ceil() as isize, 0, self.width() as isize - 1) as usize;
         let by = clamp(y.ceil() as isize, 0, self.height() as isize - 1) as usize;
-        let e1 = self.edges[ax][ay];
-        let e2 = self.edges[bx][ay];
-        let e3 = self.edges[ax][by];
-        let e4 = self.edges[bx][by];
+        let e1 = self.edges[(ax, ay)];
+        let e2 = self.edges[(bx, ay)];
+        let e3 = self.edges[(ax, by)];
+        let e4 = self.edges[(bx, by)];
         let nx = (x.fract() + 1.0).fract();
         let ny = (y.fract() + 1.0).fract();
 
@@ -109,14 +109,14 @@ impl ops::Index<usize> for Detection {
     fn index(&self, index: usize) -> &Self::Output {
         let x = index % self.width();
         let y = index / self.height();
-        &self.edges[x][y]
+        &self.edges[(x, y)]
     }
 }
 
 impl ops::Index<(usize, usize)> for Detection {
     type Output = Edge;
     fn index(&self, index: (usize, usize)) -> &Self::Output {
-        &self.edges[index.0][index.1]
+        &self.edges[index]
     }
 }
 
@@ -243,59 +243,57 @@ fn neighbour_pos_delta(theta: f32) -> (i32, i32) {
 /// Computes the edges in an image using the Canny Method.
 ///
 /// `sigma` determines the radius of the Gaussian kernel.
-fn detect_edges(image: &image::GrayImage, sigma: f32) -> Vec<Vec<Edge>> {
+fn detect_edges(image: &image::GrayImage, sigma: f32) -> Vec2d<Edge> {
     let (width, height) = (image.width() as i32, image.height() as i32);
     let (ksize, g_kernel) = filter_kernel(sigma);
     let ks = ksize as i32;
-    (0..width)
+    let data = (0..height)
         .into_par_iter()
-        .map(|g_ix| {
-            let ix = g_ix;
+        .flat_map(|g_iy| {
+            let iy = g_iy;
             let kernel = &g_kernel;
-            (0..height)
-                .into_par_iter()
-                .map(move |iy| {
-                    let mut sum_x = 0.0;
-                    let mut sum_y = 0.0;
+            (0..width).into_par_iter().map(move |ix| {
+                let mut sum_x = 0.0;
+                let mut sum_y = 0.0;
 
-                    for kyi in 0..ks {
-                        let ky = kyi - ks / 2;
-                        for kxi in 0..ks {
-                            let kx = kxi - ks / 2;
-                            let k = unsafe {
-                                let i = (kyi * ks + kxi) as usize;
-                                debug_assert!(i < kernel.len());
-                                kernel.get_unchecked(i)
-                            };
+                for kyi in 0..ks {
+                    let ky = kyi - ks / 2;
+                    for kxi in 0..ks {
+                        let kx = kxi - ks / 2;
+                        let k = unsafe {
+                            let i = (kyi * ks + kxi) as usize;
+                            debug_assert!(i < kernel.len());
+                            kernel.get_unchecked(i)
+                        };
 
-                            let pix = unsafe {
-                                // Clamp x and y within the image bounds so no non-existing borders are be
-                                // detected based on some background color outside image bounds.
-                                let x = clamp(ix + kx, 0, width - 1);
-                                let y = clamp(iy + ky, 0, height - 1);
-                                f32::from(image.unsafe_get_pixel(x as u32, y as u32).0[0])
-                            };
-                            sum_x += pix * k.0;
-                            sum_y += pix * k.1;
-                        }
+                        let pix = unsafe {
+                            // Clamp x and y within the image bounds so no non-existing borders are be
+                            // detected based on some background color outside image bounds.
+                            let x = clamp(ix + kx, 0, width - 1);
+                            let y = clamp(iy + ky, 0, height - 1);
+                            f32::from(image.unsafe_get_pixel(x as u32, y as u32).0[0])
+                        };
+                        sum_x += pix * k.0;
+                        sum_y += pix * k.1;
                     }
-                    Edge::new(sum_x / 255.0, sum_y / 255.0)
-                })
-                .collect()
+                }
+                Edge::new(sum_x / 255.0, sum_y / 255.0)
+            })
         })
-        .collect()
+        .collect();
+    Vec2d::from_vec(width as usize, height as usize, data)
 }
 
 /// Narrows the width of detected edges down to a single pixel.
-fn minmax_suppression(edges: &Detection, weak_threshold: f32) -> Vec<Vec<Edge>> {
-    let (width, height) = (edges.edges.len(), edges.edges[0].len());
-    (0..width)
+fn minmax_suppression(edges: &Detection, weak_threshold: f32) -> Vec2d<Edge> {
+    let (width, height) = (edges.edges.width, edges.edges.height);
+    let data = (0..height)
         .into_par_iter()
-        .map(|x| {
-            (0..height)
+        .flat_map(|y| {
+            (0..width)
                 .into_par_iter()
-                .map(|y| {
-                    let edge = edges.edges[x][y];
+                .map(move |x| {
+                    let edge = edges.edges[(x, y)];
                     if edge.magnitude < weak_threshold {
                         // Skip distance computation for non-edges.
                         return Edge::new(0.0, 0.0);
@@ -365,23 +363,23 @@ fn minmax_suppression(edges: &Detection, weak_threshold: f32) -> Vec<Vec<Edge>> 
                         Edge::new(0.0, 0.0)
                     }
                 })
-                .collect()
         })
-        .collect()
+        .collect();
+    Vec2d::from_vec(width, height, data)
 }
 
 /// Links lines together and discards noise.
-fn hysteresis(edges: &[Vec<Edge>], strong_threshold: f32, weak_threshold: f32) -> Vec<Vec<Edge>> {
+fn hysteresis(edges: &Vec2d<Edge>, strong_threshold: f32, weak_threshold: f32) -> Vec2d<Edge> {
     assert!(0.0 < strong_threshold && strong_threshold < 1.0);
     assert!(0.0 < weak_threshold && weak_threshold < 1.0);
     assert!(weak_threshold < strong_threshold);
 
-    let (width, height) = (edges.len(), edges.first().unwrap().len());
-    let mut edges_out: Vec<Vec<Edge>> = vec![vec![Edge::new(0.0, 0.0); height]; width];
+    let (width, height) = (edges.width, edges.height);
+    let mut edges_out = Vec2d::new(width, height, Edge::new(0.0, 0.0));
     for x in 0..width {
         for y in 0..height {
-            if edges[x][y].magnitude < strong_threshold
-                || edges_out[x][y].magnitude >= strong_threshold
+            if edges[(x, y)].magnitude < strong_threshold
+                || edges_out[(x, y)].magnitude >= strong_threshold
             {
                 continue;
             }
@@ -391,8 +389,8 @@ fn hysteresis(edges: &[Vec<Edge>], strong_threshold: f32, weak_threshold: f32) -
             for side in &[0.0, PI] {
                 let mut current_pos = (x, y);
                 loop {
-                    let edge = edges[current_pos.0][current_pos.1];
-                    edges_out[current_pos.0][current_pos.1] = edge;
+                    let edge = edges[current_pos];
+                    edges_out[current_pos] = edge;
                     // Attempt to find the next line-segment of the edge in tree directions ahead.
                     let (nb_pos, nb_magnitude) = [FRAC_PI_4, 0.0, -FRAC_PI_4]
                         .iter()
@@ -406,7 +404,7 @@ fn hysteresis(edges: &[Vec<Edge>], strong_threshold: f32, weak_threshold: f32) -
                             if 0 <= nb_x && nb_x < width as i32 && 0 <= nb_y && nb_y < height as i32
                             {
                                 let nb = (nb_x as usize, nb_y as usize);
-                                Some((nb, edges[nb.0][nb.1].magnitude))
+                                Some((nb, edges[nb].magnitude))
                             } else {
                                 None
                             }
@@ -420,8 +418,7 @@ fn hysteresis(edges: &[Vec<Edge>], strong_threshold: f32, weak_threshold: f32) -
                                 (max_pos, max_mag)
                             }
                         });
-                    if nb_magnitude < weak_threshold
-                        || edges_out[nb_pos.0][nb_pos.1].magnitude > weak_threshold
+                    if nb_magnitude < weak_threshold || edges_out[nb_pos].magnitude > weak_threshold
                     {
                         break;
                     }
@@ -433,16 +430,59 @@ fn hysteresis(edges: &[Vec<Edge>], strong_threshold: f32, weak_threshold: f32) -
     edges_out
 }
 
+#[derive(Debug, Clone)]
+struct Vec2d<T> {
+    width: usize,
+    height: usize,
+    data: Vec<T>,
+}
+
+impl<T> Vec2d<T> {
+    fn new(width: usize, height: usize, default: T) -> Self
+    where
+        T: Clone,
+    {
+        Self::from_vec(width, height, vec![default; width * height])
+    }
+
+    fn from_vec(width: usize, height: usize, data: Vec<T>) -> Self
+    where
+        T: Clone,
+    {
+        assert_eq!(width * height, data.len());
+        Self {
+            width,
+            height,
+            data,
+        }
+    }
+}
+
+impl<T> ops::Index<(usize, usize)> for Vec2d<T> {
+    type Output = T;
+    fn index(&self, index: (usize, usize)) -> &Self::Output {
+        let i = index.0 + index.1 * self.width;
+        &self.data[i]
+    }
+}
+
+impl<T> ops::IndexMut<(usize, usize)> for Vec2d<T> {
+    fn index_mut(&mut self, index: (usize, usize)) -> &mut Self::Output {
+        let i = index.0 + index.1 * self.width;
+        &mut self.data[i]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn edges_to_image(edges: &Vec<Vec<Edge>>) -> image::GrayImage {
-        let (width, height) = (edges.len(), edges.first().unwrap().len());
+    fn edges_to_image(edges: &Vec2d<Edge>) -> image::GrayImage {
+        let (width, height) = (edges.width, edges.height);
         let mut image = image::GrayImage::from_pixel(width as u32, height as u32, image::Luma([0]));
         for x in 0..width {
             for y in 0..height {
-                let edge = edges[x][y];
+                let edge = edges[(x, y)];
                 *image.get_pixel_mut(x as u32, y as u32) =
                     image::Luma([(edge.magnitude * 255.0).round() as u8]);
             }
@@ -521,7 +561,7 @@ mod tests {
             vec_y: 0.0,
         };
         let d = Detection {
-            edges: vec![vec![dummy(2.0), dummy(8.0)], vec![dummy(4.0), dummy(16.0)]],
+            edges: Vec2d::from_vec(2, 2, vec![dummy(2.0), dummy(4.0), dummy(8.0), dummy(16.0)]),
         };
         assert!((d.interpolate(0.0, 0.0).magnitude() - 2.0).abs() <= 1e-6);
         assert!((d.interpolate(1.0, 0.0).magnitude() - 4.0).abs() <= 1e-6);
@@ -562,7 +602,7 @@ mod tests {
         // Find the line.
         let mut line_x = None;
         for x in 0..detection.width() {
-            if detection.edges[x][detection.height() / 2].magnitude > 0.5 {
+            if detection.edges[(x, detection.height() / 2)].magnitude > 0.5 {
                 if line_x.is_some() {
                     panic!("the line is thicker than 1px");
                 }
@@ -575,7 +615,7 @@ mod tests {
         assert!(middle - 1 <= line_x && line_x <= middle);
         // The line should be continuous.
         for y in 0..detection.height() {
-            let edge = detection.edges[line_x][y];
+            let edge = detection.edges[(line_x, y)];
             assert!(edge.magnitude > 0.0);
         }
         // The line should be the only thing detected.
@@ -584,7 +624,7 @@ mod tests {
                 continue;
             }
             for y in 0..detection.height() {
-                assert!(detection.edges[x][y].magnitude == 0.0);
+                assert!(detection.edges[(x, y)].magnitude == 0.0);
             }
         }
         line_x
@@ -596,7 +636,7 @@ mod tests {
         let x = detect_vertical_line(&d);
         // The direction of the line's surface normal should follow the X-axis.
         for y in 0..d.height() {
-            assert!(d.edges[x][y].angle().abs() < 1e-5);
+            assert!(d.edges[(x, y)].angle().abs() < 1e-5);
         }
     }
 
@@ -606,7 +646,7 @@ mod tests {
         let x = detect_vertical_line(&d);
         // The direction of the line's surface normal should follow the X-axis.
         for y in 0..d.height() {
-            assert!(d.edges[x][y].angle().abs() < 0.01);
+            assert!(d.edges[(x, y)].angle().abs() < 0.01);
         }
     }
 
